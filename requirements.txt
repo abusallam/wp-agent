@@ -1,0 +1,5 @@
+Flask>=2.0
+google-generativeai>=0.3 # Pinned for stability, update as needed
+# Add other Python dependencies here if required by the agent
+# e.g., requests if making external HTTP calls from the agent itself
+# Werkzeug is a Flask dependency, usually managed by Flask version.
