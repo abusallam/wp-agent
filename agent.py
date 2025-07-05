@@ -90,6 +90,7 @@ def get_tool_arg(data, arg_name, default=None, required=True, arg_type=None):
 
 # --- Agent Tools ---
 
+# --- System Tools ---
 def get_system_information(data):
     """Retrieves version information for OS, Python, PHP, WordPress, and WP-CLI."""
     logger.info("Executing get_system_information tool")
@@ -123,7 +124,7 @@ def get_system_information(data):
         logger.error(f"Error in get_system_information: {e}")
         return {"status": "error", "message": str(e)}
 
-
+# --- Post Tools ---
 def create_wordpress_post(data):
     """Creates a new post or page in WordPress."""
     logger.info("Executing create_wordpress_post tool")
@@ -147,6 +148,7 @@ def create_wordpress_post(data):
         logger.error(f"Error in create_wordpress_post: {e}")
         return {"status": "error", "message": str(e)}
 
+# --- Plugin Tools ---
 def activate_wordpress_plugin(data):
     """Activates an installed WordPress plugin."""
     logger.info("Executing activate_wordpress_plugin tool")
@@ -160,7 +162,7 @@ def activate_wordpress_plugin(data):
         # We might want to check e.message or e.stderr for specific WP-CLI errors.
         return {"status": "error", "message": str(e)}
 
-
+# --- File Tools ---
 def _validate_file_path(file_path_str):
     """Validates the file path to ensure it's within SAFE_BASE_PATH."""
     # Construct the absolute path
@@ -221,7 +223,7 @@ def edit_file(data):
         logger.error(f"Error in edit_file: {e}")
         return {"status": "error", "message": str(e)}
 
-
+# --- Option Tools ---
 def get_wordpress_option(data):
     """Retrieves a WordPress option value."""
     logger.info("Executing get_wordpress_option tool")
@@ -258,6 +260,7 @@ def update_wordpress_option(data):
         logger.error(f"Error in update_wordpress_option: {e}")
         return {"status": "error", "message": str(e)}
 
+# --- Theme Tools ---
 def install_wordpress_theme(data):
     """Installs a WordPress theme."""
     logger.info("Executing install_wordpress_theme tool")
@@ -305,6 +308,79 @@ def get_active_wordpress_theme(data):
         logger.error(f"Error in get_active_wordpress_theme: {e}")
         return {"status": "error", "message": str(e)}
 
+
+def delete_wordpress_theme(data):
+    """Deletes a WordPress theme."""
+    logger.info("Executing delete_wordpress_theme tool")
+    try:
+        theme_slug = get_tool_arg(data, 'theme_slug', required=True, arg_type=str)
+        result = run_wp_cli_command(['theme', 'delete', theme_slug])
+        return {"status": "success", "message": result}
+    except Exception as e:
+        logger.error(f"Error in delete_wordpress_theme: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def append_to_file(data):
+    """Appends content to a file within the WordPress installation."""
+    logger.info("Executing append_to_file tool")
+    try:
+        file_path_str = get_tool_arg(data, 'file_path', required=True, arg_type=str)
+        content = get_tool_arg(data, 'content', required=True, arg_type=str)  # Content must be string
+
+        target_file_path = _validate_file_path(file_path_str)
+
+        with open(target_file_path, 'a', encoding='utf-8') as f:
+            f.write(content)
+        return {"status": "success", "message": f"Content appended to file '{file_path_str}' successfully."}
+    except PermissionError as e:
+        logger.error(f"Permission error in append_to_file: {e}")
+        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        logger.error(f"Error in append_to_file: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def install_wordpress_plugin(data):
+    """Installs a WordPress plugin."""
+    logger.info("Executing install_wordpress_plugin tool")
+    try:
+        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
+        version = get_tool_arg(data, 'version', required=False, arg_type=str)
+        cmd_args = ['plugin', 'install', plugin_slug]
+        if version:
+            cmd_args.extend(['--version', version])
+        result = run_wp_cli_command(cmd_args)
+        return {"status": "success", "message": result}
+    except Exception as e:
+        logger.error(f"Error in install_wordpress_plugin: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def deactivate_wordpress_plugin(data):
+    """Deactivates an installed WordPress plugin."""
+    logger.info("Executing deactivate_wordpress_plugin tool")
+    try:
+        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
+        result = run_wp_cli_command(['plugin', 'deactivate', plugin_slug])
+        return {"status": "success", "message": result}
+    except Exception as e:
+        logger.error(f"Error in deactivate_wordpress_plugin: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def delete_wordpress_plugin(data):
+    """Deletes a WordPress plugin."""
+    logger.info("Executing delete_wordpress_plugin tool")
+    try:
+        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
+        result = run_wp_cli_command(['plugin', 'delete', plugin_slug])
+        return {"status": "success", "message": result}
+    except Exception as e:
+        logger.error(f"Error in delete_wordpress_plugin: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 # --- Tool Dispatcher ---
 
 TOOLS = {
@@ -319,6 +395,11 @@ TOOLS = {
     "activate_wordpress_theme": activate_wordpress_theme,
     "list_wordpress_themes": list_wordpress_themes,
     "get_active_wordpress_theme": get_active_wordpress_theme,
+    "delete_wordpress_theme": delete_wordpress_theme,
+    "append_to_file": append_to_file,
+    "install_wordpress_plugin": install_wordpress_plugin,
+    "deactivate_wordpress_plugin": deactivate_wordpress_plugin,
+    "delete_wordpress_plugin": delete_wordpress_plugin,
 }
 
 @app.route('/a2a/task', methods=['POST'])
