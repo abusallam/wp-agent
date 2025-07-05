@@ -29,17 +29,26 @@ USER root
 
 # Create agent directory and copy agent files
 WORKDIR /var/www/html
-COPY ./agent ./agent/
+# Copy agent files - create agent directory first
+RUN mkdir -p ./agent
+COPY ./__init__.py ./agent/
+COPY ./agent.py ./agent/
+COPY ./requirements.txt ./agent/
 COPY ./entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY ./php-memory-limit.ini /usr/local/etc/php/conf.d/php-memory-limit.ini
 
 # Ensure entrypoint.sh is executable and set correct ownership
 # /var/www/html is the document root for FrankenPHP
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && chown -R frankie:frankie /var/www/html \
-    && chown frankie:frankie /usr/local/bin/entrypoint.sh
+    && chown frankie:frankie /usr/local/bin/entrypoint.sh \
+    && chown frankie:frankie /usr/local/etc/php/conf.d/php-memory-limit.ini
 
 # Switch to the non-root user 'frankie'
 USER frankie
+
+# Set A2A_API_KEY as an environment variable in the container
+ENV A2A_API_KEY=${A2A_API_KEY}
 
 # Expose ports (FrankenPHP handles this, but good for documentation)
 # Port 80 for HTTP, 443 for HTTPS, 5000 for the agent

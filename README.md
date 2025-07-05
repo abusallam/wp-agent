@@ -49,25 +49,26 @@ The architecture supports easy deployment with Docker Compose and is designed wi
 ```
 .
 ├── docker-compose.yml
+├── Dockerfile
+├── entrypoint.sh
+├── agent.py
+├── __init__.py
+├── requirements.txt
+├── php-memory-limit.ini
+├── .env
 ├── README.md
-└── wordpress/
-    ├── Dockerfile
-    ├── entrypoint.sh
-    └── agent/
-        ├── __init__.py
-        ├── agent.py
-        └── requirements.txt
+# Other files are for development/testing and not part of the core deployment.
 ```
 
 *   **`docker-compose.yml`**: Defines the `wordpress` (FrankenPHP + Python Agent) and `mariadb` services, volumes, and network configuration.
+*   **`Dockerfile`**: Builds the custom WordPress image. It starts from a FrankenPHP image, adds `wp-cli`, Python, copies the agent code and entrypoint script, and sets up user permissions.
+*   **`entrypoint.sh`**: Script executed when the WordPress container starts. It waits for the database, installs WordPress (if not already installed), installs Python dependencies, starts the Python agent in the background, and then starts FrankenPHP.
+*   **`agent.py`**: The core Python code for the Agent. It includes a Flask web server for the A2A endpoint and tool implementations that interact with `wp-cli` and the file system.
+*   **`__init__.py`**: Makes the `agent` functionality available as a Python module (though not strictly necessary as `agent.py` is run directly).
+*   **`requirements.txt`**: Lists Python dependencies for the agent (e.g., Flask).
+*   **`php-memory-limit.ini`**: PHP configuration file to increase memory limit.
+*   **`.env`**: Environment variables for Docker Compose, including sensitive keys.
 *   **`README.md`**: This file.
-*   **`wordpress/`**: Directory containing files related to the WordPress service.
-    *   **`Dockerfile`**: Builds the custom WordPress image. It starts from a FrankenPHP image, adds `wp-cli`, Python, copies the agent code and entrypoint script, and sets up user permissions.
-    *   **`entrypoint.sh`**: Script executed when the WordPress container starts. It waits for the database, installs WordPress (if not already installed), installs Python dependencies, starts the Python agent in the background, and then starts FrankenPHP.
-    *   **`agent/`**: Directory for the Python Agent.
-        *   **`__init__.py`**: Makes the `agent` directory a Python package.
-        *   **`agent.py`**: The core Python code for the Agent. It includes a Flask web server for the A2A endpoint and tool implementations that interact with `wp-cli` and the file system.
-        *   **`requirements.txt`**: Lists Python dependencies for the agent (e.g., Flask).
 
 ## 5. Setup & Local Deployment
 
@@ -117,7 +118,11 @@ If you are creating files manually:
 
 ## 6. Interacting with the Agent (A2A Tasks)
 
-The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send HTTP POST requests with a JSON payload.
+The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. All requests to this endpoint **must include an API key** in the `X-API-KEY` header for authentication.
+
+**API Key Setup:**
+1.  Ensure you have an `AGENT_API_KEY` defined in your `.env` file (e.g., `AGENT_API_KEY="your_secret_api_key"`).
+2.  This key is passed to the Docker container via `docker-compose.yml` and used by `agent.py` for authentication.
 
 **JSON Payload Structure:**
 ```json
@@ -132,9 +137,12 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
 
 ### Example Tasks (using `curl`)
 
+All `curl` commands now require the `-H "X-API-KEY: your_secret_api_key"` header. Replace `your_secret_api_key` with the actual key from your `.env` file.
+
 1.  **Get System Information:**
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "get_system_information", "args": {} }' \
          http://localhost:5000/a2a/task
     ```
@@ -142,6 +150,7 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
 2.  **Create a WordPress Post:**
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "create_wordpress_post", "args": { "title": "My Agent Post", "content": "Content by AI Agent.", "status": "publish", "post_type": "post" } }' \
          http://localhost:5000/a2a/task
     ```
@@ -153,6 +162,7 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
     (Assumes plugin is already installed, e.g., "akismet")
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "activate_wordpress_plugin", "args": { "plugin_slug": "akismet" } }' \
          http://localhost:5000/a2a/task
     ```
@@ -161,6 +171,7 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
     (Reads a file relative to `/var/www/html` inside the container)
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "read_file", "args": { "file_path": "wp-config.php" } }' \
          http://localhost:5000/a2a/task
     ```
@@ -169,6 +180,7 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
     **Caution:** This overwrites the entire file content. Use with care.
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "edit_file", "args": { "file_path": "agent-test-file.txt", "content": "Hello from the agent!\nThis is a new line." } }' \
          http://localhost:5000/a2a/task
     ```
@@ -177,6 +189,7 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
 6.  **Get a WordPress Option:**
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "get_wordpress_option", "args": { "option_name": "blogname" } }' \
          http://localhost:5000/a2a/task
     ```
@@ -184,7 +197,40 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
 7.  **Update a WordPress Option:**
     ```bash
     curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
          -d '{ "tool": "update_wordpress_option", "args": { "option_name": "blogdescription", "option_value": "Managed by an Intelligent Agent" } }' \
+         http://localhost:5000/a2a/task
+    ```
+
+8.  **List Installed Themes:**
+    ```bash
+    curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
+         -d '{ "tool": "list_wordpress_themes", "args": {} }' \
+         http://localhost:5000/a2a/task
+    ```
+
+9.  **Install a Theme:**
+    ```bash
+    curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
+         -d '{ "tool": "install_wordpress_theme", "args": { "theme_slug": "twentytwentyone" } }' \
+         http://localhost:5000/a2a/task
+    ```
+
+10. **Activate a Theme:**
+    ```bash
+    curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
+         -d '{ "tool": "activate_wordpress_theme", "args": { "theme_slug": "twentytwentyone" } }' \
+         http://localhost:5000/a2a/task
+    ```
+
+11. **Get Active Theme:**
+    ```bash
+    curl -X POST -H "Content-Type: application/json" \
+         -H "X-API-KEY: your_secret_api_key" \
+         -d '{ "tool": "get_active_wordpress_theme", "args": {} }' \
          http://localhost:5000/a2a/task
     ```
 
@@ -193,7 +239,7 @@ The Agent listens for A2A tasks on port `5000` at the `/a2a/task` endpoint. Send
 While this project provides a solid foundation, consider these for production:
 
 *   **Security Enhancements:**
-    *   **A2A Endpoint Authentication:** Implement API keys, OAuth2/JWT, or mTLS for the `/a2a/task` endpoint.
+    *   **A2A Endpoint Authentication:** Implemented API key authentication for the `/a2a/task` endpoint. For higher security (e.g., in production), consider more robust solutions like OAuth2/JWT or mTLS.
     *   **Non-Root User:** Ensure agent and web server processes run as non-root users with minimal privileges (Dockerfile attempts this with `frankie` user).
     *   **Input Validation & Sanitization:** Rigorously validate all inputs to agent tools.
     *   **File Operation Safeguards:** Enhance checks for file operations (e.g., restrict writes to specific subdirectories).
@@ -202,11 +248,11 @@ While this project provides a solid foundation, consider these for production:
     *   **Load Balancing:** Use a load balancer for multiple WordPress instances.
     *   **Managed Database:** Use a managed database service (e.g., AWS RDS, Google Cloud SQL).
 *   **Observability:**
-    *   **Structured Logging:** Implement JSON logging in `agent.py`.
+    *   **Structured Logging:** Implemented JSON logging in `agent.py` for easier parsing and integration with centralized logging systems.
     *   **Centralized Logging:** Integrate with services like ELK Stack, Splunk, or Cloud Logging.
     *   **Monitoring & Alerting:** Monitor container health, application metrics (agent tasks, errors), and WordPress performance.
 *   **Robustness & Reliability:**
-    *   **Error Handling & Retries:** Implement more sophisticated error handling and retry mechanisms in the agent.
+    *   **Error Handling & Retries:** Enhanced error handling in `agent.py` for WP-CLI commands and file operations.
     *   **Health Checks:** Utilize Docker health checks for services.
     *   **Backup & Disaster Recovery:** Implement regular backups for WordPress files and the database.
 *   **Continuous Integration/Continuous Deployment (CI/CD):**

@@ -3,7 +3,7 @@ version: '3.8'
 services:
   wordpress:
     build:
-      context: ./wordpress
+      context: .
     container_name: intelligent_wordpress_agent
     ports:
       - "80:80"  # FrankenPHP/Caddy default HTTP port
@@ -29,6 +29,7 @@ services:
       # For FrankenPHP/Caddy
       SERVER_NAME: ":80" # Listen on port 80 for HTTP
       # PHP_OPCACHE_ENABLE: "1" # Example: enable opcache; FrankenPHP has its own optimizations
+      A2A_API_KEY: ${AGENT_API_KEY} # Pass API key from .env to the container
     restart: unless-stopped
 
   db:

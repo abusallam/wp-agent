@@ -85,15 +85,14 @@ else
     echo "requirements.txt not found in ${AGENT_PATH}. Skipping Python dependencies."
 fi
 
-# Start the Python Google Agent in the background
-echo "Starting Google Agent (agent.py)..."
-# Ensure the agent is executable if it's not already
-chmod +x "${AGENT_PATH}/agent.py"
-# Run as 'frankie'. Python needs to be in PATH.
-# Log agent output to stdout/stderr of the container for Docker logs
-# Ensure PYTHONPATH includes user install location if pip3 install --user was used
-export PYTHONPATH="${HOME}/.local/bin:${PYTHONPATH}" # Common for --user installs
-python3 "${AGENT_PATH}/agent.py" &
+# Start the Python Agent in the background
+echo "Starting WordPress Agent (agent.py)..."
+# Set up Python path to include user-installed packages
+export PYTHONPATH="${HOME}/.local/lib/python3.11/site-packages:${PYTHONPATH}"
+export PATH="${HOME}/.local/bin:${PATH}"
+# Change to agent directory and run the Python agent
+cd "${AGENT_PATH}"
+python3 agent.py &
 AGENT_PID=$!
 echo "Agent started with PID ${AGENT_PID}."
 

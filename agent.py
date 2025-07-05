@@ -3,18 +3,55 @@ import subprocess
 import json
 import os
 import logging
+from functools import wraps
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure JSON logging
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+            "pathname": record.pathname,
+            "lineno": record.lineno,
+            "funcName": record.funcName,
+        }
+        if record.exc_info:
+            log_entry["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger(__name__)
 
 app = flask.Flask(__name__)
+
+# Load A2A API Key from environment variable
+A2A_API_KEY = os.environ.get('A2A_API_KEY')
+if not A2A_API_KEY:
+    logger.error("A2A_API_KEY environment variable not set. Agent will not be secured.")
 
 # WordPress installation path (should match Dockerfile WORKDIR and volume mount)
 WP_PATH = "/var/www/html"
 # Define a base path for file operations to restrict access
 # For security, agent should only operate within WP_PATH.
 SAFE_BASE_PATH = os.path.realpath(WP_PATH)
+
+def require_api_key(view_function):
+    @wraps(view_function)
+    def decorated_function(*args, **kwargs):
+        if not A2A_API_KEY:
+            logger.warning("API key not set on server, skipping authentication.")
+            return view_function(*args, **kwargs) # Allow access if key not configured (dev mode)
+
+        api_key = flask.request.headers.get('X-API-KEY')
+        if not api_key or api_key != A2A_API_KEY:
+            logger.warning(f"Unauthorized access attempt from {flask.request.remote_addr}. Invalid API key provided.")
+            return flask.jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API Key"}), 401
+        return view_function(*args, **kwargs)
+    return decorated_function
 
 def run_wp_cli_command(args, decode_json=False):
     """Helper function to run WP-CLI commands."""
@@ -28,15 +65,15 @@ def run_wp_cli_command(args, decode_json=False):
             return json.loads(output) if output else {}
         return output
     except subprocess.CalledProcessError as e:
-        logger.error(f"WP-CLI command failed: {e}")
-        logger.error(f"Stderr: {e.stderr}")
-        logger.error(f"Stdout: {e.stdout}")
-        # Propagate a more structured error
-        raise Exception(f"WP-CLI Error: {e.stderr.strip() if e.stderr else e.stdout.strip()}")
+        error_message = f"WP-CLI command failed: {e.cmd}\nReturn Code: {e.returncode}\nStderr: {e.stderr.strip()}\nStdout: {e.stdout.strip()}"
+        logger.error(error_message)
+        raise Exception(f"WP-CLI Error: {e.stderr.strip() or e.stdout.strip()}")
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode JSON from WP-CLI output: {e}")
-        logger.error(f"Raw output: {output}")
+        logger.error(f"Failed to decode JSON from WP-CLI output: {e}. Raw output: {output}")
         raise Exception(f"WP-CLI JSON Decode Error: {output}")
+    except Exception as e:
+        logger.error(f"Unexpected error running WP-CLI command: {e}")
+        raise Exception(f"Unexpected WP-CLI Error: {str(e)}")
 
 
 def get_tool_arg(data, arg_name, default=None, required=True, arg_type=None):
@@ -45,10 +82,10 @@ def get_tool_arg(data, arg_name, default=None, required=True, arg_type=None):
     if arg_name not in args and required:
         raise ValueError(f"Missing required argument: {arg_name}")
     value = args.get(arg_name, default)
-    if value is None and required: # Handles cases where default is None but arg is still missing
+    if value is None and required and default is None: # Handles cases where default is None but arg is still missing
          raise ValueError(f"Missing required argument: {arg_name}")
     if value is not None and arg_type is not None and not isinstance(value, arg_type):
-        raise ValueError(f"Argument '{arg_name}' must be of type {arg_type.__name__}")
+        raise ValueError(f"Argument '{arg_name}' must be of type {arg_type.__name__}, got {type(value).__name__}")
     return value
 
 # --- Agent Tools ---
@@ -69,16 +106,16 @@ def get_system_information(data):
         # PHP Version (via WP-CLI or php command if available directly)
         # php_version = subprocess.run(['php', '--version'], capture_output=True, text=True, check=True).stdout.splitlines()[0]
         # Using wp-cli to get PHP version as it's contextually relevant
-        php_version_raw = run_wp_cli_command(['cli', 'info', '--format=json'])
+        php_version_raw = run_wp_cli_command(['cli', 'info', '--format=json'], decode_json=True)
         info['php_version'] = php_version_raw.get('php_version', 'N/A')
 
 
         # WordPress Version
-        wp_version_raw = run_wp_cli_command(['core', 'version', '--format=json'])
+        wp_version_raw = run_wp_cli_command(['core', 'version'])
         info['wordpress_version'] = wp_version_raw # This is usually just the string of the version
 
         # WP-CLI Version
-        wp_cli_version_raw = run_wp_cli_command(['cli', 'version', '--format=json'])
+        wp_cli_version_raw = run_wp_cli_command(['cli', 'version'])
         info['wp_cli_version'] = wp_cli_version_raw # This is usually just the string of the version
 
         return {"status": "success", "data": info}
@@ -221,6 +258,53 @@ def update_wordpress_option(data):
         logger.error(f"Error in update_wordpress_option: {e}")
         return {"status": "error", "message": str(e)}
 
+def install_wordpress_theme(data):
+    """Installs a WordPress theme."""
+    logger.info("Executing install_wordpress_theme tool")
+    try:
+        theme_slug = get_tool_arg(data, 'theme_slug', required=True, arg_type=str)
+        version = get_tool_arg(data, 'version', required=False, arg_type=str)
+        cmd_args = ['theme', 'install', theme_slug]
+        if version:
+            cmd_args.extend(['--version', version])
+        result = run_wp_cli_command(cmd_args)
+        return {"status": "success", "message": result}
+    except Exception as e:
+        logger.error(f"Error in install_wordpress_theme: {e}")
+        return {"status": "error", "message": str(e)}
+
+def activate_wordpress_theme(data):
+    """Activates a WordPress theme."""
+    logger.info("Executing activate_wordpress_theme tool")
+    try:
+        theme_slug = get_tool_arg(data, 'theme_slug', required=True, arg_type=str)
+        result = run_wp_cli_command(['theme', 'activate', theme_slug])
+        return {"status": "success", "message": result}
+    except Exception as e:
+        logger.error(f"Error in activate_wordpress_theme: {e}")
+        return {"status": "error", "message": str(e)}
+
+def list_wordpress_themes(data):
+    """Lists installed WordPress themes."""
+    logger.info("Executing list_wordpress_themes tool")
+    try:
+        themes = run_wp_cli_command(['theme', 'list', '--format=json'], decode_json=True)
+        return {"status": "success", "data": themes}
+    except Exception as e:
+        logger.error(f"Error in list_wordpress_themes: {e}")
+        return {"status": "error", "message": str(e)}
+
+def get_active_wordpress_theme(data):
+    """Gets the active WordPress theme."""
+    logger.info("Executing get_active_wordpress_theme tool")
+    try:
+        # 'wp theme status' is not a valid command. 'wp theme list' with filtering is better.
+        themes = run_wp_cli_command(['theme', 'list', '--status=active', '--format=json'], decode_json=True)
+        return {"status": "success", "data": themes[0] if themes else None}
+    except Exception as e:
+        logger.error(f"Error in get_active_wordpress_theme: {e}")
+        return {"status": "error", "message": str(e)}
+
 # --- Tool Dispatcher ---
 
 TOOLS = {
@@ -231,12 +315,23 @@ TOOLS = {
     "edit_file": edit_file,
     "get_wordpress_option": get_wordpress_option,
     "update_wordpress_option": update_wordpress_option,
+    "install_wordpress_theme": install_wordpress_theme,
+    "activate_wordpress_theme": activate_wordpress_theme,
+    "list_wordpress_themes": list_wordpress_themes,
+    "get_active_wordpress_theme": get_active_wordpress_theme,
 }
 
 @app.route('/a2a/task', methods=['POST'])
+@require_api_key
 def handle_a2a_task():
     try:
-        data = flask.request.get_json()
+        # Handle JSON parsing errors specifically
+        try:
+            data = flask.request.get_json()
+        except Exception as json_error:
+            logger.warning(f"Invalid JSON received: {json_error}")
+            return flask.jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
+        
         if not data:
             return flask.jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
 
@@ -253,6 +348,9 @@ def handle_a2a_task():
         else:
             logger.warning(f"Unknown tool requested: {tool_name}")
             return flask.jsonify({"status": "error", "message": f"Unknown tool: {tool_name}"}), 404
+    except ValueError as e:
+        logger.error(f"Tool argument error: {e}")
+        return flask.jsonify({"status": "error", "message": f"Invalid tool arguments: {str(e)}"}), 400
     except Exception as e:
         logger.error(f"Unhandled error in /a2a/task: {e}", exc_info=True)
         return flask.jsonify({"status": "error", "message": f"An internal error occurred: {str(e)}"}), 500
@@ -265,4 +363,3 @@ if __name__ == '__main__':
     logger.info("Agent A2A server starting on port 5000...")
     # Host 0.0.0.0 to be accessible from outside the container
     app.run(host='0.0.0.0', port=5000, debug=False) # Debug should be False for production/staging
-```
