@@ -2,77 +2,110 @@
 set -e
 
 # --- Configuration ---
-# WordPress installation path
 WP_PATH="/var/www/html"
 AGENT_PATH="${WP_PATH}/agent"
+VENV_PATH="/opt/venv"
+LOG_DIR="/var/log/wp-agent"
 
-# --- Database Initialization ---
-# Wait for the database to become available before proceeding.
-echo "Waiting for database at ${WORDPRESS_DB_HOST}..."
-while ! mariadb -h "${WORDPRESS_DB_HOST}" -u "${WORDPRESS_DB_USER}" -p"${WORDPRESS_DB_PASSWORD}" -e "SELECT 1" > /dev/null 2>&1; do
-    echo "Database not ready, sleeping for 5 seconds..."
-    sleep 5
-done
-echo "Database is ready."
+# Enable error handling
+trap 'error_handler $? $LINENO $BASH_LINENO "$BASH_COMMAND" $(printf "::%s" ${FUNCNAME[@]:-})' ERR
 
-# --- WordPress Installation ---
-# If wp-config.php does not exist, install WordPress.
-if [ ! -f "${WP_PATH}/wp-config.php" ]; then
-    echo "WordPress not found. Starting installation..."
+# Error handling function
+error_handler() {
+    local exit_code=$1
+    local line_no=$2
+    local bash_lineno=$3
+    local last_command=$4
+    local func_trace=$5
+    echo "Error in entrypoint.sh - Exit code: $exit_code Command: $last_command Line: $line_no"
+}
 
-    # Download WordPress core files.
-    echo "Downloading WordPress core..."
-    wp core download --path="${WP_PATH}"
+# --- Environment Setup ---
+setup_environment() {
+    # Create necessary directories
+    mkdir -p "${LOG_DIR}"
+    
+    # Activate virtual environment
+    source "${VENV_PATH}/bin/activate"
+    
+    # Set environment-specific variables
+    if [ "${FLASK_ENV}" = "development" ]; then
+        export FLASK_DEBUG=1
+        export LOG_LEVEL=DEBUG
+    else
+        export FLASK_DEBUG=0
+        export LOG_LEVEL=INFO
+    fi
+}
 
-    # Create the WordPress configuration file.
-    echo "Creating wp-config.php..."
-    wp config create \
-        --path="${WP_PATH}" \
-        --dbname="${WORDPRESS_DB_NAME}" \
-        --dbuser="${WORDPRESS_DB_USER}" \
-        --dbpass="${WORDPRESS_DB_PASSWORD}" \
-        --dbhost="${WORDPRESS_DB_HOST}" \
-        --dbprefix="wp_"
+# --- Database Setup ---
+wait_for_database() {
+    echo "Waiting for database at ${WORDPRESS_DB_HOST}..."
+    until mariadb -h "${WORDPRESS_DB_HOST}" -u "${WORDPRESS_DB_USER}" -p"${WORDPRESS_DB_PASSWORD}" -e "SELECT 1" >/dev/null 2>&1; do
+        echo "Database not ready, sleeping for 5 seconds..."
+        sleep 5
+    done
+    echo "Database is ready."
+}
 
-    # Install WordPress.
-    echo "Installing WordPress..."
-    wp core install \
-        --path="${WP_PATH}" \
-        --url="${WORDPRESS_SITE_URL}" \
-        --title="${WORDPRESS_SITE_TITLE}" \
-        --admin_user="${WORDPRESS_ADMIN_USER}" \
-        --admin_password="${WORDPRESS_ADMIN_PASSWORD}" \
-        --admin_email="${WORDPRESS_ADMIN_EMAIL}" \
-        --skip-email
-
-    # Set file permissions to ensure the web server can manage the files.
-    echo "Setting WordPress file permissions..."
-    chown -R frankie:frankie "${WP_PATH}"
-
-    echo "WordPress installation complete."
-else
-    echo "WordPress is already installed."
-fi
+# --- WordPress Setup ---
+setup_wordpress() {
+    if [ ! -f "${WP_PATH}/wp-config.php" ]; then
+        echo "Installing WordPress..."
+        wp core download --path="${WP_PATH}"
+        wp config create \
+            --path="${WP_PATH}" \
+            --dbname="${WORDPRESS_DB_NAME}" \
+            --dbuser="${WORDPRESS_DB_USER}" \
+            --dbpass="${WORDPRESS_DB_PASSWORD}" \
+            --dbhost="${WORDPRESS_DB_HOST}" \
+            --dbprefix="wp_"
+        
+        wp core install \
+            --path="${WP_PATH}" \
+            --url="${WORDPRESS_SITE_URL}" \
+            --title="${WORDPRESS_SITE_TITLE}" \
+            --admin_user="${WORDPRESS_ADMIN_USER}" \
+            --admin_password="${WORDPRESS_ADMIN_PASSWORD}" \
+            --admin_email="${WORDPRESS_ADMIN_EMAIL}" \
+            --skip-email
+        
+        echo "WordPress installation complete."
+    fi
+}
 
 # --- Agent Setup ---
-# Install Python dependencies for the agent.
-echo "Installing/updating Python agent dependencies..."
-if [ -f "${AGENT_PATH}/requirements.txt" ]; then
-    pip3 install --user -r "${AGENT_PATH}/requirements.txt"
-else
-    echo "requirements.txt not found. Skipping Python dependencies."
-fi
+start_agent() {
+    cd "${AGENT_PATH}"
+    
+    if [ "${FLASK_ENV}" = "development" ]; then
+        echo "Starting agent in development mode..."
+        python -m flask run --host=0.0.0.0 --port=5000 --reload &
+    else
+        echo "Starting agent in production mode..."
+        gunicorn --bind 0.0.0.0:5000 \
+                 --workers 4 \
+                 --access-logfile "${LOG_DIR}/access.log" \
+                 --error-logfile "${LOG_DIR}/error.log" \
+                 --capture-output \
+                 --log-level "${LOG_LEVEL}" \
+                 agent:app &
+    fi
+    
+    AGENT_PID=$!
+    echo "Agent started with PID ${AGENT_PID}"
+}
 
-# Start the Python agent in the background.
-echo "Starting WordPress Agent..."
-export PYTHONPATH="${HOME}/.local/lib/python3.11/site-packages:${PYTHONPATH}"
-export PATH="${HOME}/.local/bin:${PATH}"
-cd "${AGENT_PATH}"
-python3 agent.py &
-AGENT_PID=$!
-echo "Agent started with PID ${AGENT_PID}."
+# --- Main Execution ---
+main() {
+    setup_environment
+    wait_for_database
+    setup_wordpress
+    start_agent
+    
+    # Start FrankenPHP
+    echo "Starting FrankenPHP server..."
+    exec "$@"
+}
 
-# --- Server Execution ---
-# Start the FrankenPHP server.
-echo "Starting FrankenPHP/Caddy server..."
-exec "$@"
+main "$@"

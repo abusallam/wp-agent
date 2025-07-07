@@ -1,43 +1,76 @@
 import flask
+from flask_swagger_ui import get_swaggerui_blueprint
 import subprocess
 import json
 import os
 import logging
+import structlog
 from functools import wraps
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from prometheus_flask_exporter import PrometheusMetrics
 
-# Configure JSON logging
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        log_entry = {
-            "timestamp": self.formatTime(record, self.datefmt),
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "name": record.name,
-            "pathname": record.pathname,
-            "lineno": record.lineno,
-            "funcName": record.funcName,
-        }
-        if record.exc_info:
-            log_entry["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(log_entry)
+from config import active_config
 
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
-logger = logging.getLogger(__name__)
-
+# Initialize Flask app
 app = flask.Flask(__name__)
+app.config.from_object(active_config)
 
-# Load A2A API Key from environment variable
-A2A_API_KEY = os.environ.get('A2A_API_KEY')
+# Swagger UI setup
+SWAGGER_URL = '/api/docs'  # URL for exposing Swagger UI (without trailing '/')
+API_URL = '/static/openapi.json'  # Our API url (can of course be a local file)
+
+# Call factory function to create our blueprint
+swaggerui_blueprint = get_swaggerui_blueprint(
+    SWAGGER_URL,
+    API_URL,
+    config={
+        'app_name': "WordPress Agent API"
+    }
+)
+
+app.register_blueprint(swaggerui_blueprint)
+
+# Initialize CORS
+CORS(app, origins=active_config.CORS_ORIGINS)
+
+# Initialize rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=[active_config.RATE_LIMIT]
+)
+
+# Initialize metrics
+metrics = PrometheusMetrics(app)
+
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        structlog.processors.JSONRenderer() if active_config.LOG_FORMAT == 'json'
+        else structlog.dev.ConsoleRenderer()
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger(__name__)
+
+# Load configuration
+A2A_API_KEY = active_config.A2A_API_KEY
 if not A2A_API_KEY:
-    logger.error("A2A_API_KEY environment variable not set. Agent will not be secured.")
+    logger.error("A2A_API_KEY not set. Agent will not be secured.")
 
-# WordPress installation path (should match Dockerfile WORKDIR and volume mount)
-WP_PATH = "/var/www/html"
-# Define a base path for file operations to restrict access
-# For security, agent should only operate within WP_PATH.
-SAFE_BASE_PATH = os.path.realpath(WP_PATH)
+WP_PATH = active_config.WP_PATH
+SAFE_BASE_PATH = active_config.SAFE_BASE_PATH
 
 def require_api_key(view_function):
     @wraps(view_function)
@@ -439,6 +472,10 @@ def handle_a2a_task():
 @app.route('/health', methods=['GET'])
 def health_check():
     return flask.jsonify({"status": "healthy", "message": "Agent is running"}), 200
+
+@app.route('/static/<path:path>')
+def send_static(path):
+    return flask.send_from_directory('docs', path)
 
 if __name__ == '__main__':
     logger.info("Agent A2A server starting on port 5000...")

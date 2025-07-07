@@ -1,0 +1,31 @@
+version: "3.8"
+services:
+  wp-agent:
+    build: 
+      context: .
+      target: production
+    environment:
+      - FLASK_ENV=production
+      - A2A_API_KEY=${A2A_API_KEY}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "5000:5000"
+    volumes:
+      - wordpress_data:/var/www/html/wordpress
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    command: ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--access-logfile", "-", "agent:app"]
+
+volumes:
+  wordpress_data:

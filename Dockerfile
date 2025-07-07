@@ -1,62 +1,76 @@
-# Use an official FrankenPHP image as a parent image
-# Check https://github.com/dunglas/frankenphp for available tags
+# --- Base Stage ---
 FROM dunglas/frankenphp:1.1.0-php8.3-bookworm AS base
 
 # Install system dependencies
-# - wget, unzip for WP-CLI and WordPress installation
-# - default-mysql-client or mariadb-client for wp-cli to connect to the DB (mariadb-client is more fitting for MariaDB)
-# - python3, python3-pip for the agent
-# - sudo for potential permission management (though we aim to run as non-root where possible)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     unzip \
     mariadb-client \
     python3 \
     python3-pip \
-    sudo \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Install WP-CLI
 RUN wget https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -O /usr/local/bin/wp \
     && chmod +x /usr/local/bin/wp
 
-# Set up a non-root user for WordPress and the agent
-# FrankenPHP images often run as 'frankie' or a similar user.
-# We'll ensure our files are owned by this user.
-# The default FrankenPHP user is 'frankie' (UID 1000, GID 1000)
-# WordPress files should be owned by this user for Caddy/FrankenPHP to manage them.
-USER root
+# Create Python virtual environment
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Create agent directory and copy agent files
+# Set working directory
 WORKDIR /var/www/html
-# Copy agent files - create agent directory first
-RUN mkdir -p ./agent
-COPY ./__init__.py ./agent/
-COPY ./agent.py ./agent/
-COPY ./requirements.txt ./agent/
-COPY ./entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY ./php-memory-limit.ini /usr/local/etc/php/conf.d/php-memory-limit.ini
 
-# Ensure entrypoint.sh is executable and set correct ownership
-# /var/www/html is the document root for FrankenPHP
-RUN chmod +x /usr/local/bin/entrypoint.sh \
-    && chown -R frankie:frankie /var/www/html \
-    && chown frankie:frankie /usr/local/bin/entrypoint.sh \
-    && chown frankie:frankie /usr/local/etc/php/conf.d/php-memory-limit.ini
+# Copy configuration files
+COPY ./php-memory-limit.ini /usr/local/etc/php/conf.d/
+COPY ./requirements.txt /tmp/
 
-# Switch to the non-root user 'frankie'
-USER frankie
+# Install Python dependencies
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Set A2A_API_KEY as an environment variable in the container
-ENV A2A_API_KEY=${A2A_API_KEY}
+# --- Development Stage ---
+FROM base AS development
 
-# Expose ports (FrankenPHP handles this, but good for documentation)
-# Port 80 for HTTP, 443 for HTTPS, 5000 for the agent
+# Install development dependencies
+RUN pip install --no-cache-dir pytest pytest-cov pytest-mock black flake8 pre-commit
+
+# Copy application code
+COPY . /var/www/html/
+
+# Set development environment
+ENV FLASK_ENV=development
+ENV FLASK_DEBUG=1
+ENV FLASK_APP=agent.py
+
+CMD ["python", "-m", "flask", "run", "--host=0.0.0.0"]
+
+# --- Production Stage ---
+FROM base AS production
+
+# Copy application code
+COPY . /var/www/html/
+RUN mkdir -p /var/www/html/agent
+
+# Set production environment
+ENV FLASK_ENV=production
+ENV FLASK_DEBUG=0
+
+# Install Gunicorn
+RUN pip install --no-cache-dir gunicorn
+
+# Set up non-root user
+RUN useradd -r -s /bin/false appuser && \
+    chown -R appuser:appuser /var/www/html /opt/venv
+
+USER appuser
+
+# Copy and set entrypoint
+COPY ./entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Expose ports
 EXPOSE 80 443 5000
 
-# Set the entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-
-# Default command for FrankenPHP (can be overridden by entrypoint.sh if needed)
-# The entrypoint.sh will ultimately run 'frankenphp run --config /etc/caddy/Caddyfile' or similar
-CMD ["frankenphp", "run", "--config", "/etc/caddy/Caddyfile"]

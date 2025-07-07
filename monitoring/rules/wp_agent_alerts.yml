@@ -1,0 +1,29 @@
+groups:
+  - name: wp_agent_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: rate(wp_agent_http_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate in WP Agent"
+          description: "Error rate is {{ $value }} for the last 5 minutes"
+
+      - alert: AgentDown
+        expr: up{job="wp-agent"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WP Agent is down"
+          description: "WP Agent has been down for more than 1 minute"
+
+      - alert: HighResponseTime
+        expr: rate(wp_agent_request_duration_seconds_sum[5m]) / rate(wp_agent_request_duration_seconds_count[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time"
+          description: "Average response time is above 1 second for the last 5 minutes"

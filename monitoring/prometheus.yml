@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'wp-agent'
+    static_configs:
+      - targets: ['localhost:5000']
+    metrics_path: '/metrics'
+    scheme: 'http'
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+      - targets: ['alertmanager:9093']
+
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
