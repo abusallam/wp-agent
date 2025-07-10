@@ -1,8 +1,8 @@
-version: '3.8'
+version: "3.8"
 
 services:
   wp-agent:
-    build: 
+    build:
       context: .
       target: development
     volumes:
@@ -16,9 +16,8 @@ services:
       - FLASK_ENV=development
       - FLASK_DEBUG=1
       - A2A_API_KEY=${A2A_API_KEY}
-    command: ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=5000"]
-    environment:
       - FLASK_APP=agent.app
+    command: ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=5000"]
 
 volumes:
   wordpress_data:

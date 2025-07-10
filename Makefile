@@ -1,4 +1,4 @@
-.PHONY: help dev test lint format clean build deploy
+.PHONY: help dev test lint format clean build deploy setup-hooks
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -29,3 +29,6 @@ build: ## Build production image
 
 deploy: ## Deploy to production
 	docker compose -f docker-compose.coolify.yml up -d
+
+setup-hooks: ## Setup pre-commit hooks
+	pre-commit install

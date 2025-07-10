@@ -1,483 +1,565 @@
-import flask
-from flask_swagger_ui import get_swaggerui_blueprint
-import subprocess
-import json
 import os
+import sys
+import json
 import logging
-import structlog
+import time
+import hashlib
+import subprocess
+import signal
+import threading
+from datetime import datetime, timedelta
 from functools import wraps
-from flask_cors import CORS
+from typing import Dict, Any, Optional, List
+from pathlib import Path
+import secrets
+
+import flask
+from flask import Flask, request, jsonify, g
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from prometheus_flask_exporter import PrometheusMetrics
-
-from config import active_config
-
-# Initialize Flask app
-app = flask.Flask(__name__)
-app.config.from_object(active_config)
-
-# Swagger UI setup
-SWAGGER_URL = '/api/docs'  # URL for exposing Swagger UI (without trailing '/')
-API_URL = '/static/openapi.json'  # Our API url (can of course be a local file)
-
-# Call factory function to create our blueprint
-swaggerui_blueprint = get_swaggerui_blueprint(
-    SWAGGER_URL,
-    API_URL,
-    config={
-        'app_name': "WordPress Agent API"
-    }
-)
-
-app.register_blueprint(swaggerui_blueprint)
-
-# Initialize CORS
-CORS(app, origins=active_config.CORS_ORIGINS)
-
-# Initialize rate limiting
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=[active_config.RATE_LIMIT]
-)
-
-# Initialize metrics
-metrics = PrometheusMetrics(app)
+from flask_cors import CORS
+from flask_talisman import Talisman
+import jwt
+from werkzeug.security import check_password_hash, generate_password_hash
+import redis
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+import psutil
 
 # Configure structured logging
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer() if active_config.LOG_FORMAT == 'json'
-        else structlog.dev.ConsoleRenderer()
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    cache_logger_on_first_use=True,
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(pathname)s:%(lineno)d',
+    handlers=[
+        logging.FileHandler('/app/logs/agent.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Metrics
+REQUEST_COUNT = Counter('agent_requests_total', 'Total requests', ['method', 'endpoint', 'status'])
+REQUEST_DURATION = Histogram('agent_request_duration_seconds', 'Request duration')
+ACTIVE_CONNECTIONS = Gauge('agent_active_connections', 'Active connections')
+SYSTEM_MEMORY = Gauge('agent_system_memory_percent', 'System memory usage')
+SYSTEM_CPU = Gauge('agent_system_cpu_percent', 'System CPU usage')
+
+# Configuration
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_urlsafe(32))
+    JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', secrets.token_urlsafe(32))
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=24)
+    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+    WP_PATH = os.environ.get('WP_PATH', '/var/www/html')
+    SAFE_BASE_PATH = os.path.realpath(os.environ.get('WP_PATH', '/var/www/html'))
+    AGENT_API_KEY = os.environ.get('AGENT_API_KEY', '')
+    RATE_LIMIT_STORAGE_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+    MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '10485760'))  # 10MB
+    ALLOWED_EXTENSIONS = set(os.environ.get('ALLOWED_EXTENSIONS', 'php,txt,css,js,html,json,yaml,yml').split(','))
+    BACKUP_RETENTION_DAYS = int(os.environ.get('BACKUP_RETENTION_DAYS', '7'))
+    ENABLE_PROMETHEUS = os.environ.get('ENABLE_PROMETHEUS', 'true').lower() == 'true'
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# Security headers
+Talisman(app, force_https=False)  # Set to True in production with HTTPS
+
+# CORS configuration
+CORS(app, origins=os.environ.get('ALLOWED_ORIGINS', '').split(',') if os.environ.get('ALLOWED_ORIGINS') else ['http://localhost'])
+
+# Rate limiting
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    storage_uri=Config.RATE_LIMIT_STORAGE_URL,
+    default_limits=["200 per day", "50 per hour"]
 )
 
-logger = structlog.get_logger(__name__)
+# Redis client for caching
+try:
+    redis_client = redis.from_url(Config.REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    logger.info("Redis connection established")
+except Exception as e:
+    logger.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
+    redis_client = None
 
-# Load configuration
-A2A_API_KEY = active_config.A2A_API_KEY
-if not A2A_API_KEY:
-    logger.error("A2A_API_KEY not set. Agent will not be secured.")
+# In-memory cache fallback
+memory_cache = {}
 
-WP_PATH = active_config.WP_PATH
-SAFE_BASE_PATH = active_config.SAFE_BASE_PATH
+# Circuit breaker pattern
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, recovery_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
+        
+    def call(self, func, *args, **kwargs):
+        if self.state == 'OPEN':
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = 'HALF_OPEN'
+            else:
+                raise Exception("Circuit breaker is OPEN")
+        
+        try:
+            result = func(*args, **kwargs)
+            self.on_success()
+            return result
+        except Exception as e:
+            self.on_failure()
+            raise
+    
+    def on_success(self):
+        self.failure_count = 0
+        self.state = 'CLOSED'
+    
+    def on_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = 'OPEN'
 
-def require_api_key(view_function):
-    @wraps(view_function)
+wp_cli_circuit_breaker = CircuitBreaker()
+
+# Authentication decorators
+def token_required(f):
+    @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not A2A_API_KEY:
-            logger.warning("API key not set on server, skipping authentication.")
-            return view_function(*args, **kwargs) # Allow access if key not configured (dev mode)
-
-        api_key = flask.request.headers.get('X-API-KEY')
-        if not api_key or api_key != A2A_API_KEY:
-            logger.warning(f"Unauthorized access attempt from {flask.request.remote_addr}. Invalid API key provided.")
-            return flask.jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API Key"}), 401
-        return view_function(*args, **kwargs)
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'status': 'error', 'message': 'Token is missing'}), 401
+        
+        try:
+            if token.startswith('Bearer '):
+                token = token[7:]
+            
+            # Verify JWT token
+            data = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=['HS256'])
+            g.current_user = data
+            
+        except jwt.ExpiredSignatureError:
+            return jsonify({'status': 'error', 'message': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
+        
+        return f(*args, **kwargs)
     return decorated_function
 
-def run_wp_cli_command(args, decode_json=False):
-    """Helper function to run WP-CLI commands."""
-    base_command = ['wp', f'--path={WP_PATH}', '--allow-root'] # Allow root for now, revisit permissions
+def api_key_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        if not api_key or api_key != Config.AGENT_API_KEY:
+            return jsonify({'status': 'error', 'message': 'Invalid API key'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Request logging middleware
+@app.before_request
+def log_request_info():
+    start_time = time.time()
+    g.start_time = start_time
+    
+    # Log request details
+    logger.info(f"Request: {request.method} {request.path} from {request.remote_addr}")
+    
+    # Update metrics
+    ACTIVE_CONNECTIONS.inc()
+
+@app.after_request
+def log_response_info(response):
+    duration = time.time() - g.start_time
+    
+    # Log response details
+    logger.info(f"Response: {response.status_code} in {duration:.3f}s")
+    
+    # Update metrics
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=request.endpoint or 'unknown',
+        status=response.status_code
+    ).inc()
+    
+    REQUEST_DURATION.observe(duration)
+    ACTIVE_CONNECTIONS.dec()
+    
+    return response
+
+# Caching utilities
+def cache_get(key: str) -> Optional[Any]:
+    if redis_client:
+        try:
+            data = redis_client.get(key)
+            return json.loads(data) if data else None
+        except Exception as e:
+            logger.warning(f"Redis get failed: {e}")
+            return memory_cache.get(key)
+    return memory_cache.get(key)
+
+def cache_set(key: str, value: Any, ttl: int = 300):
+    if redis_client:
+        try:
+            redis_client.setex(key, ttl, json.dumps(value))
+        except Exception as e:
+            logger.warning(f"Redis set failed: {e}")
+            memory_cache[key] = value
+    else:
+        memory_cache[key] = value
+
+# Enhanced WP-CLI command execution
+def run_wp_cli_command(args: List[str], decode_json: bool = False, timeout: int = 30) -> Any:
+    """Enhanced WP-CLI command execution with error handling and logging."""
+    base_command = ['wp', f'--path={Config.WP_PATH}', '--allow-root']
     command = base_command + args
+    
+    # Create cache key
+    cache_key = f"wp_cli:{hashlib.md5(':'.join(command).encode()).hexdigest()}"
+    
+    # Check cache for read-only commands
+    if args[0] in ['option', 'post', 'plugin'] and 'get' in args:
+        cached_result = cache_get(cache_key)
+        if cached_result:
+            return cached_result
+    
     logger.info(f"Executing WP-CLI command: {' '.join(command)}")
+    
     try:
-        process = subprocess.run(command, capture_output=True, text=True, check=True)
-        output = process.stdout.strip()
+        result = wp_cli_circuit_breaker.call(
+            subprocess.run,
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout
+        )
+        
+        output = result.stdout.strip()
+        
         if decode_json:
-            return json.loads(output) if output else {}
-        return output
+            parsed_output = json.loads(output) if output else {}
+        else:
+            parsed_output = output
+        
+        # Cache successful results
+        if args[0] in ['option', 'post', 'plugin'] and 'get' in args:
+            cache_set(cache_key, parsed_output, ttl=600)
+        
+        return parsed_output
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"WP-CLI command timeout: {' '.join(command)}")
+        raise Exception("Command timeout")
     except subprocess.CalledProcessError as e:
-        error_message = f"WP-CLI command failed: {e.cmd}\nReturn Code: {e.returncode}\nStderr: {e.stderr.strip()}\nStdout: {e.stdout.strip()}"
-        logger.error(error_message)
-        raise Exception(f"WP-CLI Error: {e.stderr.strip() or e.stdout.strip()}")
+        logger.error(f"WP-CLI command failed: {e.stderr}")
+        raise Exception(f"WP-CLI Error: {e.stderr.strip() if e.stderr else 'Unknown error'}")
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode JSON from WP-CLI output: {e}. Raw output: {output}")
-        raise Exception(f"WP-CLI JSON Decode Error: {output}")
-    except Exception as e:
-        logger.error(f"Unexpected error running WP-CLI command: {e}")
-        raise Exception(f"Unexpected WP-CLI Error: {str(e)}")
+        logger.error(f"JSON decode error: {e}")
+        raise Exception(f"Invalid JSON response: {output}")
 
-
-def get_tool_arg(data, arg_name, default=None, required=True, arg_type=None):
-    """Helper to get and validate arguments for tools."""
+# Input validation
+def validate_input(data: Dict[str, Any], required_fields: List[str], field_types: Dict[str, type] = None) -> Dict[str, Any]:
+    """Validate input data with required fields and type checking."""
     args = data.get('args', {})
-    if arg_name not in args and required:
-        raise ValueError(f"Missing required argument: {arg_name}")
-    value = args.get(arg_name, default)
-    if value is None and required and default is None: # Handles cases where default is None but arg is still missing
-         raise ValueError(f"Missing required argument: {arg_name}")
-    if value is not None and arg_type is not None and not isinstance(value, arg_type):
-        raise ValueError(f"Argument '{arg_name}' must be of type {arg_type.__name__}, got {type(value).__name__}")
-    return value
+    
+    for field in required_fields:
+        if field not in args:
+            raise ValueError(f"Missing required field: {field}")
+    
+    if field_types:
+        for field, expected_type in field_types.items():
+            if field in args and not isinstance(args[field], expected_type):
+                raise ValueError(f"Field '{field}' must be of type {expected_type.__name__}")
+    
+    return args
 
-# --- Agent Tools ---
+# File path validation
+def validate_file_path(file_path_str: str) -> str:
+    """Enhanced file path validation with security checks."""
+    # Normalize path and remove leading slashes
+    normalized_path = os.path.normpath(file_path_str.lstrip('/\\'))
+    
+    # Construct absolute path
+    abs_file_path = os.path.join(Config.SAFE_BASE_PATH, normalized_path)
+    real_abs_file_path = os.path.realpath(abs_file_path)
+    
+    # Security check: ensure path is within allowed directory
+    if not real_abs_file_path.startswith(Config.SAFE_BASE_PATH):
+        raise PermissionError(f"Path '{file_path_str}' is outside allowed directory")
+    
+    # Check file extension
+    file_ext = Path(file_path_str).suffix.lstrip('.')
+    if file_ext and file_ext not in Config.ALLOWED_EXTENSIONS:
+        raise PermissionError(f"File extension '{file_ext}' not allowed")
+    
+    return real_abs_file_path
 
-# --- System Tools ---
-def get_system_information(data):
-    """Retrieves version information for OS, Python, PHP, WordPress, and WP-CLI."""
-    logger.info("Executing get_system_information tool")
-    info = {}
+# Backup utilities
+def create_backup(file_path: str) -> str:
+    """Create backup of file before modification."""
+    backup_dir = '/app/backups'
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_name = f"{Path(file_path).name}_{timestamp}.backup"
+    backup_path = os.path.join(backup_dir, backup_name)
+    
     try:
-        # OS Version (example, might need refinement for specific details)
-        os_version = subprocess.run(['uname', '-a'], capture_output=True, text=True, check=True).stdout.strip()
-        info['os_version'] = os_version
+        with open(file_path, 'rb') as src, open(backup_path, 'wb') as dst:
+            dst.write(src.read())
+        return backup_path
+    except Exception as e:
+        logger.error(f"Backup creation failed: {e}")
+        raise
 
-        # Python Version
-        python_version = subprocess.run(['python3', '--version'], capture_output=True, text=True, check=True).stdout.strip()
-        info['python_version'] = python_version
+def cleanup_old_backups():
+    """Clean up old backup files."""
+    backup_dir = '/app/backups'
+    if not os.path.exists(backup_dir):
+        return
+    
+    cutoff_time = time.time() - (Config.BACKUP_RETENTION_DAYS * 24 * 60 * 60)
+    
+    for file_path in Path(backup_dir).glob('*.backup'):
+        if file_path.stat().st_mtime < cutoff_time:
+            try:
+                file_path.unlink()
+                logger.info(f"Cleaned up old backup: {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to clean up backup {file_path}: {e}")
 
-        # PHP Version (via WP-CLI or php command if available directly)
-        # php_version = subprocess.run(['php', '--version'], capture_output=True, text=True, check=True).stdout.splitlines()[0]
-        # Using wp-cli to get PHP version as it's contextually relevant
-        php_version_raw = run_wp_cli_command(['cli', 'info', '--format=json'], decode_json=True)
-        info['php_version'] = php_version_raw.get('php_version', 'N/A')
-
-
-        # WordPress Version
-        wp_version_raw = run_wp_cli_command(['core', 'version'])
-        info['wordpress_version'] = wp_version_raw # This is usually just the string of the version
-
-        # WP-CLI Version
-        wp_cli_version_raw = run_wp_cli_command(['cli', 'version'])
-        info['wp_cli_version'] = wp_cli_version_raw # This is usually just the string of the version
-
-        return {"status": "success", "data": info}
+# Enhanced agent tools
+def get_system_information(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Get comprehensive system information."""
+    logger.info("Executing get_system_information tool")
+    
+    try:
+        info = {
+            'timestamp': datetime.now().isoformat(),
+            'system': {
+                'os': subprocess.run(['uname', '-a'], capture_output=True, text=True).stdout.strip(),
+                'uptime': subprocess.run(['uptime'], capture_output=True, text=True).stdout.strip(),
+                'memory': {
+                    'total': psutil.virtual_memory().total,
+                    'available': psutil.virtual_memory().available,
+                    'percent': psutil.virtual_memory().percent
+                },
+                'cpu': {
+                    'count': psutil.cpu_count(),
+                    'percent': psutil.cpu_percent(interval=1)
+                },
+                'disk': {
+                    'total': psutil.disk_usage('/').total,
+                    'used': psutil.disk_usage('/').used,
+                    'free': psutil.disk_usage('/').free,
+                    'percent': psutil.disk_usage('/').percent
+                }
+            },
+            'application': {
+                'python_version': sys.version,
+                'agent_version': '2.0.0',
+                'flask_version': flask.__version__
+            }
+        }
+        
+        # WordPress information
+        try:
+            wp_info = run_wp_cli_command(['core', 'version', '--extra', '--format=json'], decode_json=True)
+            info['wordpress'] = wp_info
+        except Exception as e:
+            logger.warning(f"Failed to get WordPress info: {e}")
+            info['wordpress'] = {'error': str(e)}
+        
+        # Update system metrics
+        SYSTEM_MEMORY.set(info['system']['memory']['percent'])
+        SYSTEM_CPU.set(info['system']['cpu']['percent'])
+        
+        return {'status': 'success', 'data': info}
+        
     except Exception as e:
         logger.error(f"Error in get_system_information: {e}")
-        return {"status": "error", "message": str(e)}
+        return {'status': 'error', 'message': str(e)}
 
-# --- Post Tools ---
-def create_wordpress_post(data):
-    """Creates a new post or page in WordPress."""
+def create_wordpress_post(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Create WordPress post with enhanced validation."""
     logger.info("Executing create_wordpress_post tool")
+    
     try:
-        title = get_tool_arg(data, 'title', required=True, arg_type=str)
-        content = get_tool_arg(data, 'content', required=True, arg_type=str)
-        status = get_tool_arg(data, 'status', default='publish', arg_type=str)
-        post_type = get_tool_arg(data, 'post_type', default='post', arg_type=str)
-
+        args = validate_input(data, ['title', 'content'], {
+            'title': str,
+            'content': str,
+            'status': str,
+            'post_type': str
+        })
+        
+        # Sanitize inputs
+        title = args['title'][:200]  # Limit title length
+        content = args['content'][:50000]  # Limit content length
+        status = args.get('status', 'publish')
+        post_type = args.get('post_type', 'post')
+        
+        # Validate status and post_type
+        valid_statuses = ['publish', 'draft', 'pending', 'private']
+        valid_post_types = ['post', 'page']
+        
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid status. Must be one of: {valid_statuses}")
+        
+        if post_type not in valid_post_types:
+            raise ValueError(f"Invalid post_type. Must be one of: {valid_post_types}")
+        
         cmd_args = [
             'post', 'create',
             f'--post_title={title}',
             f'--post_content={content}',
             f'--post_status={status}',
             f'--post_type={post_type}',
-            '--porcelain' # Outputs only the new post ID
+            '--porcelain'
         ]
+        
         post_id = run_wp_cli_command(cmd_args)
-        return {"status": "success", "message": f"{post_type.capitalize()} created successfully with ID: {post_id}", "post_id": post_id}
+        
+        # Invalidate related caches
+        cache_keys = [f"wp_cli:*post*", f"wp_cli:*{post_type}*"]
+        for key in cache_keys:
+            if redis_client:
+                redis_client.delete(key)
+        
+        return {
+            'status': 'success',
+            'message': f'{post_type.capitalize()} created successfully',
+            'post_id': post_id,
+            'post_url': f"{os.environ.get('WORDPRESS_SITE_URL', 'http://localhost')}/?p={post_id}"
+        }
+        
     except Exception as e:
         logger.error(f"Error in create_wordpress_post: {e}")
-        return {"status": "error", "message": str(e)}
+        return {'status': 'error', 'message': str(e)}
 
-# --- Plugin Tools ---
-def activate_wordpress_plugin(data):
-    """Activates an installed WordPress plugin."""
-    logger.info("Executing activate_wordpress_plugin tool")
-    try:
-        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
-        result = run_wp_cli_command(['plugin', 'activate', plugin_slug])
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in activate_wordpress_plugin: {e}")
-        # WP-CLI often returns non-zero exit code for "already active" with a message.
-        # We might want to check e.message or e.stderr for specific WP-CLI errors.
-        return {"status": "error", "message": str(e)}
-
-# --- File Tools ---
-def _validate_file_path(file_path_str):
-    """Validates the file path to ensure it's within SAFE_BASE_PATH."""
-    # Construct the absolute path
-    abs_file_path = os.path.join(SAFE_BASE_PATH, os.path.normpath(file_path_str.lstrip('/\\')))
-
-    # Ensure the path is normalized and under SAFE_BASE_PATH
-    # os.path.commonprefix is not foolproof for path traversal alone.
-    # We need to ensure the real, resolved path starts with SAFE_BASE_PATH.
-    real_abs_file_path = os.path.realpath(abs_file_path)
-
-    if not real_abs_file_path.startswith(SAFE_BASE_PATH):
-        raise PermissionError(f"File access denied: Path '{file_path_str}' is outside the allowed directory '{WP_PATH}'.")
-    return real_abs_file_path
-
-
-def read_file(data):
-    """Reads the content of a file within the WordPress installation."""
+def read_file(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Read file with enhanced security and validation."""
     logger.info("Executing read_file tool")
+    
     try:
-        file_path_str = get_tool_arg(data, 'file_path', required=True, arg_type=str)
-        target_file_path = _validate_file_path(file_path_str)
-
+        args = validate_input(data, ['file_path'], {'file_path': str})
+        file_path_str = args['file_path']
+        
+        target_file_path = validate_file_path(file_path_str)
+        
         if not os.path.exists(target_file_path):
-            return {"status": "error", "message": f"File not found: {file_path_str}"}
+            return {'status': 'error', 'message': f'File not found: {file_path_str}'}
+        
         if not os.path.isfile(target_file_path):
-            return {"status": "error", "message": f"Path is not a file: {file_path_str}"}
-
+            return {'status': 'error', 'message': f'Path is not a file: {file_path_str}'}
+        
+        # Check file size
+        file_size = os.path.getsize(target_file_path)
+        if file_size > Config.MAX_FILE_SIZE:
+            return {'status': 'error', 'message': f'File too large: {file_size} bytes'}
+        
         with open(target_file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        return {"status": "success", "file_path": file_path_str, "content": content}
-    except PermissionError as e:
-        logger.error(f"Permission error in read_file: {e}")
-        return {"status": "error", "message": str(e)}
+        
+        # Create file hash for integrity checking
+        file_hash = hashlib.sha256(content.encode()).hexdigest()
+        
+        return {
+            'status': 'success',
+            'file_path': file_path_str,
+            'content': content,
+            'size': file_size,
+            'hash': file_hash,
+            'last_modified': datetime.fromtimestamp(os.path.getmtime(target_file_path)).isoformat()
+        }
+        
     except Exception as e:
         logger.error(f"Error in read_file: {e}")
-        return {"status": "error", "message": str(e)}
+        return {'status': 'error', 'message': str(e)}
 
-
-def edit_file(data):
-    """Edits/Overwrites a file within the WordPress installation."""
+def edit_file(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Edit file with backup and validation."""
     logger.info("Executing edit_file tool")
+    
     try:
-        file_path_str = get_tool_arg(data, 'file_path', required=True, arg_type=str)
-        content = get_tool_arg(data, 'content', required=True, arg_type=str) # Content must be string
-
-        target_file_path = _validate_file_path(file_path_str)
-
-        # For safety, ensure the parent directory exists if we are creating a new file (optional)
-        # os.makedirs(os.path.dirname(target_file_path), exist_ok=True)
-
-        with open(target_file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        return {"status": "success", "message": f"File '{file_path_str}' written successfully."}
-    except PermissionError as e:
-        logger.error(f"Permission error in edit_file: {e}")
-        return {"status": "error", "message": str(e)}
+        args = validate_input(data, ['file_path', 'content'], {
+            'file_path': str,
+            'content': str
+        })
+        
+        file_path_str = args['file_path']
+        content = args['content']
+        
+        target_file_path = validate_file_path(file_path_str)
+        
+        # Check content size
+        if len(content.encode()) > Config.MAX_FILE_SIZE:
+            return {'status': 'error', 'message': 'Content too large'}
+        
+        # Create backup if file exists
+        backup_path = None
+        if os.path.exists(target_file_path):
+            backup_path = create_backup(target_file_path)
+        
+        # Write file atomically
+        temp_file = f"{target_file_path}.tmp"
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            # Atomic rename
+            os.rename(temp_file, target_file_path)
+            
+            # Verify write
+            with open(target_file_path, 'r', encoding='utf-8') as f:
+                written_content = f.read()
+            
+            if written_content != content:
+                raise Exception("File write verification failed")
+            
+            # Create content hash
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+            
+            return {
+                'status': 'success',
+                'message': f'File {file_path_str} written successfully',
+                'backup_path': backup_path,
+                'size': len(content.encode()),
+                'hash': content_hash
+            }
+            
+        except Exception as e:
+            # Cleanup temp file
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+            raise
+            
     except Exception as e:
         logger.error(f"Error in edit_file: {e}")
-        return {"status": "error", "message": str(e)}
+        return {'status': 'error', 'message': str(e)}
 
-# --- Option Tools ---
-def get_wordpress_option(data):
-    """Retrieves a WordPress option value."""
-    logger.info("Executing get_wordpress_option tool")
+# Additional tools
+def get_wordpress_plugins(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Get WordPress plugins list."""
+    logger.info("Executing get_wordpress_plugins tool")
+    
     try:
-        option_name = get_tool_arg(data, 'option_name', required=True, arg_type=str)
-        # Using --format=json for potentially complex option types, though many are strings.
-        value = run_wp_cli_command(['option', 'get', option_name, '--format=json'], decode_json=True)
-        return {"status": "success", "option_name": option_name, "value": value}
+        plugins = run_wp_cli_command(['plugin', 'list', '--format=json'], decode_json=True)
+        return {'status': 'success', 'plugins': plugins}
     except Exception as e:
-        logger.error(f"Error in get_wordpress_option: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Error in get_wordpress_plugins: {e}")
+        return {'status': 'error', 'message': str(e)}
 
-
-def update_wordpress_option(data):
-    """Updates a WordPress option."""
-    logger.info("Executing update_wordpress_option tool")
-    try:
-        option_name = get_tool_arg(data, 'option_name', required=True, arg_type=str)
-        option_value = get_tool_arg(data, 'option_value', required=True) # Value can be string, number, bool
-
-        cmd_args = ['option', 'update', option_name]
-        # WP-CLI 'option update' expects the value as a string.
-        # For structured data (arrays, objects), it can take JSON if --format=json is used for the value.
-        # Here, we assume option_value is a simple string or will be stringified.
-        # If complex JSON objects need to be passed, this needs adjustment.
-        if isinstance(option_value, (dict, list)):
-             cmd_args.extend([json.dumps(option_value), '--format=json'])
-        else:
-            cmd_args.append(str(option_value))
-
-        result = run_wp_cli_command(cmd_args)
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in update_wordpress_option: {e}")
-        return {"status": "error", "message": str(e)}
-
-# --- Theme Tools ---
-def install_wordpress_theme(data):
-    """Installs a WordPress theme."""
-    logger.info("Executing install_wordpress_theme tool")
-    try:
-        theme_slug = get_tool_arg(data, 'theme_slug', required=True, arg_type=str)
-        version = get_tool_arg(data, 'version', required=False, arg_type=str)
-        cmd_args = ['theme', 'install', theme_slug]
-        if version:
-            cmd_args.extend(['--version', version])
-        result = run_wp_cli_command(cmd_args)
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in install_wordpress_theme: {e}")
-        return {"status": "error", "message": str(e)}
-
-def activate_wordpress_theme(data):
-    """Activates a WordPress theme."""
-    logger.info("Executing activate_wordpress_theme tool")
-    try:
-        theme_slug = get_tool_arg(data, 'theme_slug', required=True, arg_type=str)
-        result = run_wp_cli_command(['theme', 'activate', theme_slug])
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in activate_wordpress_theme: {e}")
-        return {"status": "error", "message": str(e)}
-
-def list_wordpress_themes(data):
-    """Lists installed WordPress themes."""
-    logger.info("Executing list_wordpress_themes tool")
+def get_wordpress_themes(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Get WordPress themes list."""
+    logger.info("Executing get_wordpress_themes tool")
+    
     try:
         themes = run_wp_cli_command(['theme', 'list', '--format=json'], decode_json=True)
-        return {"status": "success", "data": themes}
+        return {'status': 'success', 'themes': themes}
     except Exception as e:
-        logger.error(f"Error in list_wordpress_themes: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Error in get_wordpress_themes: {e}")
+        return {'status': 'error', 'message': str(e)}
 
-def get_active_wordpress_theme(data):
-    """Gets the active WordPress theme."""
-    logger.info("Executing get_active_wordpress_theme tool")
-    try:
-        # 'wp theme status' is not a valid command. 'wp theme list' with filtering is better.
-        themes = run_wp_cli_command(['theme', 'list', '--status=active', '--format=json'], decode_json=True)
-        return {"status": "success", "data": themes[0] if themes else None}
-    except Exception as e:
-        logger.error(f"Error in get_active_wordpress_theme: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-def delete_wordpress_theme(data):
-    """Deletes a WordPress theme."""
-    logger.info("Executing delete_wordpress_theme tool")
-    try:
-        theme_slug = get_tool_arg(data, 'theme_slug', required=True, arg_type=str)
-        result = run_wp_cli_command(['theme', 'delete', theme_slug])
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in delete_wordpress_theme: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-def append_to_file(data):
-    """Appends content to a file within the WordPress installation."""
-    logger.info("Executing append_to_file tool")
-    try:
-        file_path_str = get_tool_arg(data, 'file_path', required=True, arg_type=str)
-        content = get_tool_arg(data, 'content', required=True, arg_type=str)  # Content must be string
-
-        target_file_path = _validate_file_path(file_path_str)
-
-        with open(target_file_path, 'a', encoding='utf-8') as f:
-            f.write(content)
-        return {"status": "success", "message": f"Content appended to file '{file_path_str}' successfully."}
-    except PermissionError as e:
-        logger.error(f"Permission error in append_to_file: {e}")
-        return {"status": "error", "message": str(e)}
-    except Exception as e:
-        logger.error(f"Error in append_to_file: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-def install_wordpress_plugin(data):
-    """Installs a WordPress plugin."""
-    logger.info("Executing install_wordpress_plugin tool")
-    try:
-        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
-        version = get_tool_arg(data, 'version', required=False, arg_type=str)
-        cmd_args = ['plugin', 'install', plugin_slug]
-        if version:
-            cmd_args.extend(['--version', version])
-        result = run_wp_cli_command(cmd_args)
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in install_wordpress_plugin: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-def deactivate_wordpress_plugin(data):
-    """Deactivates an installed WordPress plugin."""
-    logger.info("Executing deactivate_wordpress_plugin tool")
-    try:
-        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
-        result = run_wp_cli_command(['plugin', 'deactivate', plugin_slug])
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in deactivate_wordpress_plugin: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-def delete_wordpress_plugin(data):
-    """Deletes a WordPress plugin."""
-    logger.info("Executing delete_wordpress_plugin tool")
-    try:
-        plugin_slug = get_tool_arg(data, 'plugin_slug', required=True, arg_type=str)
-        result = run_wp_cli_command(['plugin', 'delete', plugin_slug])
-        return {"status": "success", "message": result}
-    except Exception as e:
-        logger.error(f"Error in delete_wordpress_plugin: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-# --- Tool Dispatcher ---
-
-TOOLS = {
-    "get_system_information": get_system_information,
-    "create_wordpress_post": create_wordpress_post,
-    "activate_wordpress_plugin": activate_wordpress_plugin,
-    "read_file": read_file,
-    "edit_file": edit_file,
-    "get_wordpress_option": get_wordpress_option,
-    "update_wordpress_option": update_wordpress_option,
-    "install_wordpress_theme": install_wordpress_theme,
-    "activate_wordpress_theme": activate_wordpress_theme,
-    "list_wordpress_themes": list_wordpress_themes,
-    "get_active_wordpress_theme": get_active_wordpress_theme,
-    "delete_wordpress_theme": delete_wordpress_theme,
-    "append_to_file": append_to_file,
-    "install_wordpress_plugin": install_wordpress_plugin,
-    "deactivate_wordpress_plugin": deactivate_wordpress_plugin,
-    "delete_wordpress_plugin": delete_wordpress_plugin,
-}
-
-@app.route('/a2a/task', methods=['POST'])
-@require_api_key
-def handle_a2a_task():
-    try:
-        # Handle JSON parsing errors specifically
-        try:
-            data = flask.request.get_json()
-        except Exception as json_error:
-            logger.warning(f"Invalid JSON received: {json_error}")
-            return flask.jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
-        
-        if not data:
-            return flask.jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
-
-        tool_name = data.get('tool')
-        if not tool_name:
-            return flask.jsonify({"status": "error", "message": "Missing 'tool' field in request"}), 400
-
-        if tool_name in TOOLS:
-            logger.info(f"Received A2A task for tool: {tool_name}")
-            tool_function = TOOLS[tool_name]
-            # Pass the whole data dict so tools can extract args themselves
-            result = tool_function(data)
-            return flask.jsonify(result)
-        else:
-            logger.warning(f"Unknown tool requested: {tool_name}")
-            return flask.jsonify({"status": "error", "message": f"Unknown tool: {tool_name}"}), 404
-    except ValueError as e:
-        logger.error(f"Tool argument error: {e}")
-        return flask.jsonify({"status": "error", "message": f"Invalid tool arguments: {str(e)}"}), 400
-    except Exception as e:
-        logger.error(f"Unhandled error in /a2a/task: {e}", exc_info=True)
-        return flask.jsonify({"status": "error", "message": f"An internal error occurred: {str(e)}"}), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return flask.jsonify({"status": "healthy", "message": "Agent is running"}), 200
-
-@app.route('/static/<path:path>')
-def send_static(path):
-    return flask.send_from_directory('docs', path)
-
-if __name__ == '__main__':
-    logger.info("Agent A2A server starting on port 5000...")
-    # Host 0.0.0.0 to be accessible from outside the container
-    app.run(host='0.0.0.0', port=5000, debug=False) # Debug should be False for production/staging
+def backup_database(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Create database

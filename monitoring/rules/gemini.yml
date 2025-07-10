@@ -1,0 +1,20 @@
+groups:
+- name: gemini_model_alerts
+  rules:
+  - alert: GeminiHighLatency
+    expr: 'avg_over_time(gemini_api_request_latency_seconds[5m]) > 1.5'
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High latency detected for Gemini model"
+      description: "The average latency for Gemini API requests has exceeded 1.5 seconds over the last 5 minutes."
+
+  - alert: GeminiHighErrorRate
+    expr: 'sum(rate(gemini_api_requests_total{status="error"}[5m])) / sum(rate(gemini_api_requests_total[5m])) > 0.05'
+    for: 15m
+    labels:
+      severity: critical
+    annotations:
+      summary: "High error rate for Gemini model"
+      description: "The error rate for Gemini API requests is above 5% over the last 15 minutes."
