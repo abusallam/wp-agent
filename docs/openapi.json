@@ -1,0 +1,139 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "WordPress Agent API",
+    "version": "1.0.0",
+    "description": "A RESTful API to programmatically control a WordPress installation."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5000",
+      "description": "Development server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "description": "Returns the health status of the agent.",
+        "responses": {
+          "200": {
+            "description": "Agent is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "healthy"
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Agent is running"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/a2a/task": {
+      "post": {
+        "summary": "Execute an A2A Task",
+        "description": "Executes a specified tool with the given arguments.",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "tool": {
+                    "type": "string",
+                    "description": "The name of the tool to execute.",
+                    "enum": [
+                      "get_system_information",
+                      "create_wordpress_post",
+                      "activate_wordpress_plugin",
+                      "read_file",
+                      "edit_file",
+                      "get_wordpress_option",
+                      "update_wordpress_option",
+                      "install_wordpress_theme",
+                      "activate_wordpress_theme",
+                      "list_wordpress_themes",
+                      "get_active_wordpress_theme",
+                      "delete_wordpress_theme",
+                      "append_to_file",
+                      "install_wordpress_plugin",
+                      "deactivate_wordpress_plugin",
+                      "delete_wordpress_plugin"
+                    ]
+                  },
+                  "args": {
+                    "type": "object",
+                    "description": "The arguments for the tool."
+                  }
+                },
+                "required": ["tool"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Task executed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "success"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not Found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-KEY"
+      }
+    }
+  }
+}

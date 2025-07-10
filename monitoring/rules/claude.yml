@@ -1,0 +1,20 @@
+groups:
+- name: claude_model_alerts
+  rules:
+  - alert: ClaudeHighLatency
+    expr: 'avg_over_time(claude_api_request_latency_seconds[5m]) > 2.0'
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High latency detected for Claude model"
+      description: "The average latency for Claude API requests has exceeded 2.0 seconds over the last 5 minutes."
+
+  - alert: ClaudeHighErrorRate
+    expr: 'sum(rate(claude_api_requests_total{status="error"}[5m])) / sum(rate(claude_api_requests_total[5m])) > 0.03'
+    for: 15m
+    labels:
+      severity: critical
+    annotations:
+      summary: "High error rate for Claude model"
+      description: "The error rate for Claude API requests is above 3% over the last 15 minutes."

@@ -1,52 +1,23 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  wordpress:
+  wp-agent:
     build:
-      context: ./wordpress
-    container_name: intelligent_wordpress_agent
+      context: .
+      target: development
+    volumes:
+      - .:/var/www/html
+      - wordpress_data:/var/www/html/wordpress
     ports:
-      - "80:80"  # FrankenPHP/Caddy default HTTP port
-      - "443:443" # FrankenPHP/Caddy default HTTPS port
-      - "5000:5000" # Agent A2A port
-    volumes:
-      - wordpress_data:/var/www/html
-      # Optional: Mount local agent code for development (uncomment if needed)
-      # - ./wordpress/agent:/var/www/html/agent
-    depends_on:
-      - db
+      - "80:80"
+      - "443:443"
+      - "5000:5000"
     environment:
-      WORDPRESS_DB_HOST: db
-      WORDPRESS_DB_USER: wordpressuser
-      WORDPRESS_DB_PASSWORD: wordpresspassword
-      WORDPRESS_DB_NAME: wordpress
-      # Variables for entrypoint.sh for initial WordPress setup
-      WORDPRESS_ADMIN_USER: admin
-      WORDPRESS_ADMIN_PASSWORD: password
-      WORDPRESS_ADMIN_EMAIL: admin@example.com
-      WORDPRESS_SITE_TITLE: "Intelligent WP Agent Site"
-      WORDPRESS_SITE_URL: "http://localhost" # Change if you have a different domain
-      # For FrankenPHP/Caddy
-      SERVER_NAME: ":80" # Listen on port 80 for HTTP
-      # PHP_OPCACHE_ENABLE: "1" # Example: enable opcache; FrankenPHP has its own optimizations
-    restart: unless-stopped
-
-  db:
-    image: mariadb:10.11 # Using a specific stable version
-    container_name: wordpress_mariadb
-    volumes:
-      - db_data:/var/lib/mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: wordpress
-      MYSQL_USER: wordpressuser
-      MYSQL_PASSWORD: wordpresspassword
-    restart: unless-stopped
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - A2A_API_KEY=${A2A_API_KEY}
+      - FLASK_APP=agent.app
+    command: ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=5000"]
 
 volumes:
   wordpress_data:
-  db_data:
-
-networks:
-  default:
-    driver: bridge
